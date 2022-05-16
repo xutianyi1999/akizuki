@@ -22,3 +22,4 @@ chrono = "0.4"
 crossbeam-channel = "0.5"
 ipnet = "2"
 iprange = "0.6"
+windows = {version = "0.36", features = ["Win32_Networking_WinSock"]}

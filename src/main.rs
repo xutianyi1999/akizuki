@@ -4,8 +4,9 @@ extern crate log;
 use std::cell::UnsafeCell;
 use std::io::{BufRead, Cursor};
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::ops::Deref;
+use std::os::windows::io::AsRawSocket;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -39,19 +40,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-macro_rules! ternary {
-    ($condition: expr, $_true: expr, $_false: expr) => {
-        if $condition {
-            $_true
-        } else {
-            $_false
-        }
-    };
-}
-
-//1MB
-const VIRTUAL_ADDR: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 2);
-const TUN_ADDR: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 1);
+const VIRTUAL_ADDR: Ipv4Addr = Ipv4Addr::new(169, 254, 30, 2);
+const TUN_ADDR: Ipv4Addr = Ipv4Addr::new(169, 254, 30, 1);
 const INNER_TCP_SERVER_BIND_PORT: u16 = 19980;
 
 // src port -> dst
@@ -61,8 +51,8 @@ static mut UDP_NAT_MAP: MaybeUninit<
     RwLock<AHashMap<u16, UnboundedSender<(Box<[u8]>, SocketAddrV4)>>>,
 > = MaybeUninit::uninit();
 static mut DIRECT_INTERFACE_ADDR: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
-static mut PROXY_INTERFACE_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-static mut SOCKS5_SERVER: MaybeUninit<SocketAddr> = MaybeUninit::uninit();
+static mut PROXY_INTERFACE_ADDR: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
+static mut SOCKS5_SERVER: MaybeUninit<SocketAddrV4> = MaybeUninit::uninit();
 static mut RULE: MaybeUninit<Rule> = MaybeUninit::uninit();
 static LOCAL_CLOCK: AtomicI64 = AtomicI64::new(0);
 
@@ -94,19 +84,19 @@ fn get_direct_interface_addr() -> Ipv4Addr {
     unsafe { DIRECT_INTERFACE_ADDR }
 }
 
-fn set_proxy_interface_addr(addr: IpAddr) {
+fn set_proxy_interface_addr(addr: Ipv4Addr) {
     unsafe { PROXY_INTERFACE_ADDR = addr }
 }
 
-fn get_proxy_interface_addr() -> IpAddr {
+fn get_proxy_interface_addr() -> Ipv4Addr {
     unsafe { PROXY_INTERFACE_ADDR }
 }
 
-fn set_proxy(proxy: SocketAddr) {
+fn set_proxy(proxy: SocketAddrV4) {
     unsafe { SOCKS5_SERVER.write(proxy) };
 }
 
-fn get_proxy() -> SocketAddr {
+fn get_proxy() -> SocketAddrV4 {
     unsafe { *SOCKS5_SERVER.assume_init_ref() }
 }
 
@@ -139,6 +129,28 @@ impl<T> CellWarp<T> {
 
     fn get_mut(&self) -> &mut T {
         unsafe { &mut *self.v.get() }
+    }
+}
+
+fn set_socket_interface<T: AsRawSocket>(socket: &T, addr: Ipv4Addr) -> Result<()> {
+    let raw = socket.as_raw_socket();
+
+    unsafe {
+        let addr_bytes = addr.octets();
+
+        let code = windows::Win32::Networking::WinSock::setsockopt(
+            windows::Win32::Networking::WinSock::SOCKET(raw as usize),
+            windows::Win32::Networking::WinSock::IPPROTO_IP as i32,
+            windows::Win32::Networking::WinSock::IP_UNICAST_IF as i32,
+            windows::core::PCSTR(addr_bytes.as_ptr()),
+            4,
+        );
+
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(anyhow!("Set socket interface failure"))
+        }
     }
 }
 
@@ -184,7 +196,7 @@ async fn connection_timeout_scheduler() {
             for (key, (_, state)) in guard.iter() {
                 if let TCPState::Handshaking(time) = state {
                     // 180 secs
-                    if now - time > 180 {
+                    if now - time > 60 {
                         remove_list.push(*key);
                     }
                 }
@@ -235,17 +247,19 @@ impl Socket {
 
         // direct only support ipv4
         let udp_socket = UdpSocket::bind((get_direct_interface_addr(), 0)).await?;
+        set_socket_interface(&udp_socket, get_direct_interface_addr())?;
         let udp_socket = Arc::new(udp_socket);
 
         self.direct = Some(udp_socket.clone());
 
         let tx = self.send_channel.clone();
+        let inner_udp_socket = udp_socket.clone();
         let handle = tokio::spawn(async move {
             let mut buff = vec![0u8; 65536];
 
             loop {
                 let res = async {
-                    let (len, from) = udp_socket.recv_from(&mut buff).await?;
+                    let (len, from) = inner_udp_socket.recv_from(&mut buff).await?;
                     Ok((buff[..len].into(), from))
                 };
                 if let Err(e) = tx.send(res.await) {
@@ -256,14 +270,8 @@ impl Socket {
         });
 
         self.handle_list.push(handle);
-
-        match self.direct {
-            None => unreachable!(),
-            Some(ref v) => {
-                v.send_to(buff, dst_addr).await?;
-                Ok(())
-            }
-        }
+        udp_socket.send_to(buff, dst_addr).await?;
+        Ok(())
     }
 
     async fn send_to_proxy(&mut self, buff: &[u8], dst_addr: SocketAddr) -> Result<()> {
@@ -272,25 +280,18 @@ impl Socket {
             return Ok(());
         }
 
-        let tcp_socket = ternary!(
-            get_proxy_interface_addr().is_ipv4(),
-            TcpSocket::new_v4()?,
-            TcpSocket::new_v6()?
-        );
-
-        tcp_socket.bind(SocketAddr::new(get_proxy_interface_addr(), 0))?;
-        let stream = tcp_socket.connect(get_proxy()).await?;
+        let tcp_socket = TcpSocket::new_v4()?;
+        tcp_socket.bind(SocketAddr::new(IpAddr::V4(get_proxy_interface_addr()), 0))?;
+        set_socket_interface(&tcp_socket, get_proxy_interface_addr())?;
+        let stream = tcp_socket.connect(SocketAddr::V4(get_proxy())).await?;
 
         let udp_socket = UdpSocket::bind((get_proxy_interface_addr(), 0)).await?;
+        set_socket_interface(&udp_socket, get_proxy_interface_addr())?;
         let socks_datagram = SocksDatagram::associate(
             stream,
             udp_socket,
             None,
-            Some(ternary!(
-                get_proxy_interface_addr().is_ipv4(),
-                (IpAddr::from(Ipv4Addr::UNSPECIFIED), 0),
-                (IpAddr::from(Ipv6Addr::UNSPECIFIED), 0)
-            )),
+            Some((IpAddr::from(Ipv4Addr::UNSPECIFIED), 0)),
         )
         .await?;
 
@@ -298,12 +299,13 @@ impl Socket {
         self.proxy = Some(socks_datagram.clone());
 
         let tx = self.send_channel.clone();
+        let inner_socks_datagram = socks_datagram.clone();
         let handle = tokio::spawn(async move {
             let mut buff = vec![0u8; 65536];
 
             loop {
                 let res = async {
-                    let (len, from) = socks_datagram.recv_from(&mut buff).await?;
+                    let (len, from) = inner_socks_datagram.recv_from(&mut buff).await?;
                     let from = match from {
                         AddrKind::Ip(v) => v,
                         AddrKind::Domain(domain, port) => tokio::net::lookup_host((domain, port))
@@ -322,14 +324,8 @@ impl Socket {
         });
 
         self.handle_list.push(handle);
-
-        match self.proxy {
-            None => unreachable!(),
-            Some(ref v) => {
-                v.send_to(buff, dst_addr).await?;
-                Ok(())
-            }
-        }
+        socks_datagram.send_to(buff, dst_addr).await?;
+        Ok(())
     }
 
     async fn recv(&mut self) -> Result<(Box<[u8]>, SocketAddr)> {
@@ -441,19 +437,18 @@ async fn tcp_handler() -> Result<()> {
                 };
 
                 if get_rule().is_proxy(original_peer_addr.ip()) {
-                    let tcp_socket = ternary!(
-                        get_proxy_interface_addr().is_ipv4(),
-                        TcpSocket::new_v4()?,
-                        TcpSocket::new_v6()?
-                    );
+                    let tcp_socket = TcpSocket::new_v4()?;
+                    tcp_socket.bind(SocketAddr::new(IpAddr::V4(get_proxy_interface_addr()), 0))?;
+                    set_socket_interface(&tcp_socket, get_proxy_interface_addr())?;
 
-                    tcp_socket.bind(SocketAddr::new(get_proxy_interface_addr(), 0))?;
-                    let mut dst_stream = tcp_socket.connect(get_proxy()).await?;
+                    let mut dst_stream = tcp_socket.connect(SocketAddr::V4(get_proxy())).await?;
                     async_socks5::connect(&mut dst_stream, original_peer_addr, None).await?;
                     tokio::io::copy_bidirectional(&mut src_stream, &mut dst_stream).await?;
                 } else {
                     let tcp_socket = TcpSocket::new_v4()?;
                     tcp_socket.bind(SocketAddr::new(IpAddr::V4(get_direct_interface_addr()), 0))?;
+                    set_socket_interface(&tcp_socket, get_direct_interface_addr())?;
+
                     let mut dst_stream = tcp_socket
                         .connect(SocketAddr::V4(original_peer_addr))
                         .await?;
@@ -464,11 +459,15 @@ async fn tcp_handler() -> Result<()> {
 
             let res = future.await;
 
-            get_tcp_nat_map().write().remove(&peer_addr.port());
-
             if let Err(e) = res {
                 error!("{:?}", e)
             }
+
+            // todo Wait connection to be released
+            sleep(Duration::from_millis(500)).await;
+
+            // todo maybe delete another new record
+            get_tcp_nat_map().write().remove(&peer_addr.port());
         });
     }
 }
@@ -517,9 +516,9 @@ fn bridge(tun: Arc<Wintun>, mpsc_rx: crossbeam_channel::Receiver<Box<[u8]>>) -> 
             let ipv4 = Ipv4Packet::new_unchecked(&*packet);
 
             if ipv4.protocol() != IpProtocol::Udp {
-                continue
+                continue;
             }
-            let udp= UdpPacket::new_unchecked(ipv4.payload());
+            let udp = UdpPacket::new_unchecked(ipv4.payload());
             let src = SocketAddrV4::new(Ipv4Addr::from(ipv4.src_addr().0), udp.src_port());
             let dst = SocketAddrV4::new(Ipv4Addr::from(ipv4.src_addr().0), udp.dst_port());
             debug!("UDP packet {} -> {}", src, dst);
@@ -539,14 +538,14 @@ fn tun_handler(tun: Arc<Wintun>, bridge_tx: Sender<Box<[u8]>>) -> Result<()> {
                 let mut ipv4 = Ipv4Packet::new_unchecked(&mut buff[..len]);
                 let protocol = ipv4.protocol();
                 let src_addr = Ipv4Addr::from(ipv4.src_addr().0);
-                let dst_addr = Ipv4Addr::from( ipv4.dst_addr().0);
+                let dst_addr = Ipv4Addr::from(ipv4.dst_addr().0);
 
                 match protocol {
                     IpProtocol::Tcp => {
                         let mut tcp = TcpPacket::new_unchecked(ipv4.payload_mut());
 
-                        let src = SocketAddrV4::new(Ipv4Addr::from(src_addr), tcp.src_port());
-                        let dst = SocketAddrV4::new(Ipv4Addr::from(dst_addr), tcp.dst_port());
+                        let src = SocketAddrV4::new(src_addr, tcp.src_port());
+                        let dst = SocketAddrV4::new(dst_addr, tcp.dst_port());
 
                         let (new_src, new_dst) = if src
                             == SocketAddrV4::new(TUN_ADDR, INNER_TCP_SERVER_BIND_PORT)
@@ -563,6 +562,7 @@ fn tun_handler(tun: Arc<Wintun>, bridge_tx: Sender<Box<[u8]>>) -> Result<()> {
                         } else if *src.ip() == TUN_ADDR {
                             debug!("TCP packet {} -> {}", src, dst);
 
+                            // todo need to check dst address
                             if !get_tcp_nat_map().read().contains_key(&src.port()) {
                                 get_tcp_nat_map().write().insert(
                                     src.port(),
@@ -601,8 +601,8 @@ fn tun_handler(tun: Arc<Wintun>, bridge_tx: Sender<Box<[u8]>>) -> Result<()> {
                         }
 
                         let mut udp = UdpPacket::new_unchecked(ipv4.payload_mut());
-                        let src = SocketAddrV4::new(Ipv4Addr::from(src_addr), udp.src_port());
-                        let dst = SocketAddrV4::new(Ipv4Addr::from(dst_addr), udp.dst_port());
+                        let src = SocketAddrV4::new(src_addr, udp.src_port());
+                        let dst = SocketAddrV4::new(dst_addr, udp.dst_port());
 
                         debug!("UDP packet {} -> {}", src, dst);
 
@@ -684,17 +684,14 @@ fn create_tun_adapter() -> Result<Wintun> {
     Ok(wintun)
 }
 
-pub async fn find_interface_addr(dest_addr: SocketAddr) -> Result<IpAddr> {
-    let socket = UdpSocket::bind(ternary!(
-        dest_addr.is_ipv4(),
-        (IpAddr::from(Ipv4Addr::UNSPECIFIED), 0),
-        (IpAddr::from(Ipv6Addr::UNSPECIFIED), 0)
-    ))
-    .await?;
-
+pub async fn find_interface_addr(dest_addr: SocketAddrV4) -> Result<Ipv4Addr> {
+    let socket = UdpSocket::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), 0)).await?;
     socket.connect(dest_addr).await?;
     let addr = socket.local_addr()?;
-    Ok(addr.ip())
+    Ok(match addr.ip() {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(_) => unreachable!(),
+    })
 }
 
 async fn parse_rules(file_path: &str) -> Result<IpRange<Ipv4Net>> {
@@ -720,6 +717,10 @@ async fn process(args: Args) -> Result<()> {
         .next()
         .ok_or_else(|| anyhow!("Socks5 server host not found"))?;
 
+    let socks5_server = match socks5_server {
+        SocketAddr::V4(v) => v,
+        SocketAddr::V6(_) => return Err(anyhow!("IPV6 socks5 server address is not supported")),
+    };
     set_proxy(socks5_server);
 
     let rule = match args.rule {
@@ -736,19 +737,18 @@ async fn process(args: Args) -> Result<()> {
 
     LOCAL_CLOCK.store(Utc::now().timestamp(), Ordering::Relaxed);
 
-    match find_interface_addr(SocketAddr::from(([8, 8, 8, 8], 0))).await? {
-        IpAddr::V4(v) => set_direct_interface_addr(v),
-        IpAddr::V6(_) => unreachable!(),
-    }
+    let direct_interface_addr =
+        find_interface_addr(SocketAddrV4::from_str("8.8.8.8:53").unwrap()).await?;
+    set_direct_interface_addr(direct_interface_addr);
 
     set_proxy_interface_addr(find_interface_addr(socks5_server).await?);
 
     set_tcp_nat_map(RwLock::new(AHashMap::new()));
     set_udp_nat_map(RwLock::new(AHashMap::new()));
 
-    let tun = Arc::new(create_tun_adapter()?);
-
     info!("Create tun");
+
+    let tun = Arc::new(tokio::task::spawn_blocking(|| create_tun_adapter()).await??);
 
     let (bridge_tx, bridge_rx) = crossbeam_channel::unbounded::<Box<[u8]>>();
     let inner_tun = tun.clone();
