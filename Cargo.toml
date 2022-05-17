@@ -13,7 +13,6 @@ smoltcp = { version = "0.8", default-features = false, features = ["proto-ipv4"]
 parking_lot = "0.12"
 async-socks5 = "0.5"
 ahash = "0.7"
-libloading = "0.7"
 anyhow = "1"
 sscanf = "0.2"
 log4rs = "1"

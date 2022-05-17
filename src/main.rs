@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::AHashMap;
-use anyhow::anyhow;
 use anyhow::Result;
+use anyhow::{anyhow, Context};
 use async_socks5::{AddrKind, SocksDatagram};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -54,6 +54,7 @@ static mut DIRECT_INTERFACE_ADDR: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
 static mut PROXY_INTERFACE_ADDR: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
 static mut SOCKS5_SERVER: MaybeUninit<SocketAddrV4> = MaybeUninit::uninit();
 static mut RULE: MaybeUninit<Rule> = MaybeUninit::uninit();
+static mut UDP_THROUGH_PROXY: bool = false;
 static LOCAL_CLOCK: AtomicI64 = AtomicI64::new(0);
 
 fn set_tcp_nat_map(map: RwLock<AHashMap<u16, (SocketAddrV4, TCPState)>>) {
@@ -106,6 +107,14 @@ fn set_rule(rule: Rule) {
 
 fn get_rule() -> &'static Rule {
     unsafe { RULE.assume_init_ref() }
+}
+
+fn set_udp_through_proxy(flag: bool) {
+    unsafe { UDP_THROUGH_PROXY = flag }
+}
+
+fn get_udp_through_proxy() -> bool {
+    unsafe { UDP_THROUGH_PROXY }
 }
 
 struct CellWarp<T> {
@@ -248,18 +257,19 @@ impl Socket {
         // direct only support ipv4
         let udp_socket = UdpSocket::bind((get_direct_interface_addr(), 0)).await?;
         set_socket_interface(&udp_socket, get_direct_interface_addr())?;
+
         let udp_socket = Arc::new(udp_socket);
+        udp_socket.send_to(buff, dst_addr).await?;
 
         self.direct = Some(udp_socket.clone());
 
         let tx = self.send_channel.clone();
-        let inner_udp_socket = udp_socket.clone();
         let handle = tokio::spawn(async move {
             let mut buff = vec![0u8; 65536];
 
             loop {
                 let res = async {
-                    let (len, from) = inner_udp_socket.recv_from(&mut buff).await?;
+                    let (len, from) = udp_socket.recv_from(&mut buff).await?;
                     Ok((buff[..len].into(), from))
                 };
                 if let Err(e) = tx.send(res.await) {
@@ -270,7 +280,6 @@ impl Socket {
         });
 
         self.handle_list.push(handle);
-        udp_socket.send_to(buff, dst_addr).await?;
         Ok(())
     }
 
@@ -296,16 +305,16 @@ impl Socket {
         .await?;
 
         let socks_datagram = Arc::new(socks_datagram);
+        socks_datagram.send_to(buff, dst_addr).await?;
         self.proxy = Some(socks_datagram.clone());
 
         let tx = self.send_channel.clone();
-        let inner_socks_datagram = socks_datagram.clone();
         let handle = tokio::spawn(async move {
             let mut buff = vec![0u8; 65536];
 
             loop {
                 let res = async {
-                    let (len, from) = inner_socks_datagram.recv_from(&mut buff).await?;
+                    let (len, from) = socks_datagram.recv_from(&mut buff).await?;
                     let from = match from {
                         AddrKind::Ip(v) => v,
                         AddrKind::Domain(domain, port) => tokio::net::lookup_host((domain, port))
@@ -324,7 +333,6 @@ impl Socket {
         });
 
         self.handle_list.push(handle);
-        socks_datagram.send_to(buff, dst_addr).await?;
         Ok(())
     }
 
@@ -384,10 +392,10 @@ async fn udp_channel(
             let socket = socket.get_mut();
             latest_update_time.store(get_timestamp(), Ordering::Relaxed);
 
-            if get_rule().is_proxy(dest.ip()) {
-                socket.send(&packet, SocketAddr::V4(dest)).await
-            } else {
+            if get_udp_through_proxy() && get_rule().is_proxy(dest.ip()) {
                 socket.send_to_proxy(&packet, SocketAddr::V4(dest)).await
+            } else {
+                socket.send(&packet, SocketAddr::V4(dest)).await
             }?;
         }
         Ok(())
@@ -606,32 +614,29 @@ fn tun_handler(tun: Arc<Wintun>, bridge_tx: Sender<Box<[u8]>>) -> Result<()> {
 
                         debug!("UDP packet {} -> {}", src, dst);
 
-                        loop {
-                            let guard = get_udp_nat_map().read();
+                        let guard = get_udp_nat_map().read();
 
-                            match guard.get(&src.port()) {
-                                None => {
-                                    drop(guard);
-                                    let (udp_channel_tx, udp_channel_rx) =
-                                        mpsc::unbounded_channel();
+                        match guard.get(&src.port()) {
+                            None => {
+                                drop(guard);
+                                let (udp_channel_tx, udp_channel_rx) = mpsc::unbounded_channel();
+                                udp_channel_tx
+                                    .send((Box::from(udp.payload_mut() as &[u8]), dst))?;
+                                get_udp_nat_map().write().insert(src.port(), udp_channel_tx);
 
-                                    get_udp_nat_map().write().insert(src.port(), udp_channel_tx);
+                                let bridge_tx = bridge_tx.clone();
 
-                                    let bridge_tx = bridge_tx.clone();
-
-                                    tokio::spawn(async move {
-                                        if let Err(e) =
-                                            udp_channel(bridge_tx, udp_channel_rx, src).await
-                                        {
-                                            error!("{}", e)
-                                        }
-                                        get_udp_nat_map().write().remove(&src.port());
-                                    });
-                                }
-                                Some(v) => {
-                                    v.send((Box::from(udp.payload_mut() as &[u8]), dst))?;
-                                    break;
-                                }
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        udp_channel(bridge_tx, udp_channel_rx, src).await
+                                    {
+                                        error!("{}", e)
+                                    }
+                                    get_udp_nat_map().write().remove(&src.port());
+                                });
+                            }
+                            Some(v) => {
+                                v.send((Box::from(udp.payload_mut() as &[u8]), dst))?;
                             }
                         }
                     }
@@ -735,6 +740,8 @@ async fn process(args: Args) -> Result<()> {
     };
     set_rule(rule);
 
+    set_udp_through_proxy(args.udp_through_proxy);
+
     LOCAL_CLOCK.store(Utc::now().timestamp(), Ordering::Relaxed);
 
     let direct_interface_addr =
@@ -752,10 +759,21 @@ async fn process(args: Args) -> Result<()> {
 
     let (bridge_tx, bridge_rx) = crossbeam_channel::unbounded::<Box<[u8]>>();
     let inner_tun = tun.clone();
-    let handle1 =
-        async { tokio::task::spawn_blocking(move || tun_handler(inner_tun, bridge_tx)).await? };
-    let handle2 = async { tokio::task::spawn_blocking(|| bridge(tun, bridge_rx)).await? };
-    let handle3 = async { tokio::spawn(tcp_handler()).await? };
+    let handle1 = async {
+        tokio::task::spawn_blocking(move || tun_handler(inner_tun, bridge_tx))
+            .await
+            .context("Tun handler error")?
+    };
+    let handle2 = async {
+        tokio::task::spawn_blocking(|| bridge(tun, bridge_rx))
+            .await
+            .context("Bridge error")?
+    };
+    let handle3 = async {
+        tokio::spawn(tcp_handler())
+            .await
+            .context("Tcp handler error")?
+    };
     let handle4 = async {
         tokio::spawn(clock_task()).await?;
         Ok(())
@@ -812,6 +830,10 @@ struct Args {
     /// Socks5 server address
     #[clap(short, long)]
     socks5_server: String,
+
+    /// UDP packet through proxy
+    #[clap(short, long)]
+    udp_through_proxy: bool,
 
     #[clap(subcommand)]
     rule: RuleCmd,
