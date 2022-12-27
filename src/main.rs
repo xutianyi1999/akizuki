@@ -29,7 +29,6 @@ use log4rs::encode::pattern::PatternEncoder;
 use log4rs::Config;
 use parking_lot::RwLock;
 use simple_wintun::adapter::{WintunAdapter, WintunStream};
-use simple_wintun::ReadResult;
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -151,8 +150,7 @@ fn set_socket_interface<T: AsRawSocket>(socket: &T, addr: Ipv4Addr) -> Result<()
             windows::Win32::Networking::WinSock::SOCKET(raw as usize),
             windows::Win32::Networking::WinSock::IPPROTO_IP as i32,
             windows::Win32::Networking::WinSock::IP_UNICAST_IF as i32,
-            windows::core::PCSTR(addr_bytes.as_ptr()),
-            4,
+            Some(&addr_bytes),
         );
 
         if code == 0 {
@@ -507,12 +505,8 @@ impl Wintun {
     }
 
     fn recv_packet(&self, buff: &mut [u8]) -> Result<usize> {
-        let res = unsafe { self.session.assume_init_ref() }.read_packet(buff)?;
-
-        match res {
-            ReadResult::Success(len) => Ok(len),
-            ReadResult::NotEnoughSize(_) => Ok(0),
-        }
+        let len = unsafe { self.session.assume_init_ref() }.read_packet(buff)?;
+        Ok(len)
     }
 }
 

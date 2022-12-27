@@ -6,19 +6,19 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "3", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 simple_wintun = { git = "https://github.com/xutianyi1999/SimpleWintun.git" }
 smoltcp = { version = "0.8", default-features = false, features = ["proto-ipv4"] }
 parking_lot = "0.12"
 async-socks5 = "0.5"
-ahash = "0.7"
+ahash = "0.8"
 anyhow = "1"
-sscanf = "0.2"
+sscanf = "0.4"
 log4rs = "1"
 log = "0.4"
 chrono = "0.4"
 crossbeam-channel = "0.5"
 ipnet = "2"
 iprange = "0.6"
-windows = {version = "0.36", features = ["Win32_Networking_WinSock"]}
+windows = {version = "0.43", features = ["Win32_Foundation", "Win32_Networking_WinSock"]}
