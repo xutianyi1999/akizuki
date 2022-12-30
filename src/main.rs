@@ -373,12 +373,13 @@ async fn udp_channel(
             );
 
             let mut ipv4 = Ipv4Packet::new_unchecked(&mut buff);
-            ipv4.set_version(0b0100);
-            ipv4.set_header_len(0b0101);
+            ipv4.set_version(4);
+            ipv4.set_header_len(20);
             ipv4.set_total_len(smoltcp::wire::IPV4_HEADER_LEN as u16 + udp_len as u16);
             ipv4.set_protocol(IpProtocol::Udp);
             ipv4.set_src_addr(Ipv4Address(from_ip.octets()));
             ipv4.set_dst_addr(Ipv4Address(local_addr.ip().octets()));
+            ipv4.set_hop_limit(255);
             ipv4.fill_checksum();
 
             tx.send(buff.into_boxed_slice())?;
